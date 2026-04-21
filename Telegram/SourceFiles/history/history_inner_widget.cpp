@@ -3350,9 +3350,81 @@ bool HistoryInner::showCopyRestrictionForSelected() {
 }
 
 void HistoryInner::copySelectedText() {
-	if (!showCopyRestrictionForSelected()) {
-		TextUtilities::SetClipboardText(getSelectedText());
+	if (showCopyRestrictionForSelected()) {
+		return;
 	}
+	if (_selected.empty()) return;
+
+	auto urls = QList<QUrl>();
+	auto html = QString("<html><body>");
+	auto fullText = QString("");
+
+	// In HistoryInner, _selected is already a map of not_null<HistoryItem*>, which is sorted by position.
+	for (const auto &[item, selection] : _selected) {
+		const auto view = viewByItem(item);
+		if (!view) continue;
+
+		// 1. Handle Text
+		auto itemText = HistoryItemText(item).rich.text;
+		if (!itemText.isEmpty()) {
+			fullText += itemText + "\n";
+			html += "<p>" + itemText.toHtmlEscaped() + "</p>";
+		}
+
+		// 2. Handle Media and Markers
+		if (const auto media = item->media()) {
+			QString marker;
+			if (const auto p = media->photo()) {
+				const auto pMedia = p->activeMediaView();
+				if (pMedia && pMedia->loaded()) {
+					const auto bytes = pMedia->imageBytes(Data::PhotoSize::Large);
+					if (!bytes.isEmpty()) {
+						html += QString("<br><img src=\"data:image/jpeg;base64,%1\"><br>").arg(QString(bytes.toBase64()));
+					}
+				}
+				marker = "[ Photo ]";
+			} else if (const auto d = media->document()) {
+				const auto filepath = d->filepath(true);
+				marker = "[ File: " + d->filename() + " ]";
+				if (!filepath.isEmpty()) {
+					urls.push_back(QUrl::fromLocalFile(filepath));
+					html += QString("<br><img src=\"file:///%1\"><br>").arg(filepath);
+				}
+			}
+
+			if (!marker.isEmpty()) {
+				fullText += marker + "\n";
+			}
+		}
+		fullText += "\n";
+	}
+	html += "</body></html>";
+
+	auto mimeData = std::make_unique<QMimeData>();
+	mimeData->setText(fullText.trimmed());
+	mimeData->setHtml(html);
+	if (!urls.isEmpty()) {
+		mimeData->setUrls(urls);
+		// Set first image as preview
+		for (const auto &[item, selection] : _selected) {
+			if (const auto media = item->media()) {
+				if (const auto photo = media->photo()) {
+					const auto pMedia = photo->activeMediaView();
+					if (pMedia && pMedia->loaded()) {
+						if (const auto imgPtr = pMedia->image(Data::PhotoSize::Large)) {
+							auto img = imgPtr->original();
+							if (!img.isNull()) {
+								mimeData->setImageData(std::move(img));
+								break;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	QGuiApplication::clipboard()->setMimeData(mimeData.release());
 }
 
 void HistoryInner::editCaptionUploadLayer(not_null<HistoryItem*> item) {

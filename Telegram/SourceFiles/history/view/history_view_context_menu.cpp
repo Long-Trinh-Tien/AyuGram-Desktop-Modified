@@ -1328,7 +1328,7 @@ base::unique_qptr<Ui::PopupMenu> FillContextMenu(
 			: tr::lng_context_copy_selected_items(tr::now);
 		result->addAction(text, [=] {
 			if (!list->showCopyRestrictionForSelected()) {
-				TextUtilities::SetClipboardText(list->getSelectedText());
+				list->copySelected();
 			}
 		}, &st::menuIconCopy);
 	}

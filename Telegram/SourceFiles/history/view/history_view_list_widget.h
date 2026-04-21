@@ -348,6 +348,7 @@ public:
 		not_null<HistoryItem*> item) const;
 	[[nodiscard]] bool showCopyRestriction(HistoryItem *item = nullptr);
 	[[nodiscard]] bool showCopyMediaRestriction(not_null<HistoryItem*> item);
+	void copySelected();
 	[[nodiscard]] bool hasCopyRestrictionForSelected() const;
 	[[nodiscard]] bool showCopyRestrictionForSelected();
 	[[nodiscard]] bool hasSelectRestriction() const;

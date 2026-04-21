@@ -7,6 +7,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "history/view/history_view_list_widget.h"
 
+#include "data/data_photo.h"
+#include "data/data_photo_media.h"
+#include "data/data_session.h"
+#include "data/data_groups.h"
+#include "data/data_peer.h"
+#include "history/history.h"
 #include "base/unixtime.h"
 #include "base/qt/qt_key_modifiers.h"
 #include "base/qt/qt_common_adapters.h"
@@ -1628,22 +1634,97 @@ bool ListWidget::showCopyMediaRestriction(not_null<HistoryItem*> item) {
 	return true;
 }
 
-bool ListWidget::hasCopyRestrictionForSelected() const {
-	if (hasCopyRestriction()) {
-		return true;
-	}
-	if (_selected.empty()) {
-		if (_selectedTextItem && _selectedTextItem->forbidsForward()) {
-			return true;
-		}
-	}
+void ListWidget::copySelected() {
+	if (_selected.empty()) return;
+
+	auto urls = QList<QUrl>();
+	auto html = QString("<html><body>");
+	auto fullText = QString("");
+	auto firstPhoto = (PhotoData*)nullptr;
+	
+	// Create a sorted list of items to ensure correct order
+	struct OrderedItem {
+		not_null<HistoryItem*> item;
+	};
+	std::vector<OrderedItem> items;
 	for (const auto &[itemId, selection] : _selected) {
 		if (const auto item = session().data().message(itemId)) {
-			if (item->forbidsForward()) {
-				return true;
+			items.push_back({ item });
+		}
+	}
+	// Sort by position
+	std::sort(items.begin(), items.end(), [](const OrderedItem &a, const OrderedItem &b) {
+		return a.item->position() < b.item->position();
+	});
+
+	for (const auto &it : items) {
+		const auto item = it.item;
+		const auto view = item->mainView();
+		if (!view) continue;
+
+		// 1. Handle Text
+		auto itemText = HistoryItemText(item).rich.text;
+		if (!itemText.isEmpty()) {
+			fullText += itemText + "\n";
+			html += "<p>" + itemText.toHtmlEscaped() + "</p>";
+		}
+
+		// 2. Handle Media and Markers
+		if (const auto media = item->media()) {
+			QString marker;
+			if (const auto p = media->photo()) {
+				const auto pMedia = p->activeMediaView();
+				if (pMedia && pMedia->loaded()) {
+				if (const auto imgPtr = pMedia->image(Data::PhotoSize::Large)) {
+					const auto bytes = pMedia->imageBytes(Data::PhotoSize::Large);
+					if (!bytes.isEmpty()) {
+						html += QString("<br><img src=\"data:image/jpeg;base64,%1\"><br>").arg(QString(bytes.toBase64()));
+					}
+				}
+				}				marker = "[ Photo ]";
+				if (!firstPhoto) firstPhoto = p;
+			} else if (const auto d = media->document()) {
+				const auto filepath = d->filepath(true);
+				marker = "[ File: " + d->filename() + " ]";
+				if (!filepath.isEmpty()) {
+					urls.push_back(QUrl::fromLocalFile(filepath));
+					html += QString("<br><img src=\"file:///%1\"><br>").arg(filepath);
+				}
+			}
+
+			if (!marker.isEmpty()) {
+				fullText += marker + "\n";
+			}
+		}
+		fullText += "\n"; // Space between messages
+	}
+	html += "</body></html>";
+
+	auto mimeData = std::make_unique<QMimeData>();
+	mimeData->setText(fullText.trimmed());
+	mimeData->setHtml(html);
+	if (!urls.isEmpty()) {
+		mimeData->setUrls(urls);
+	}
+	
+	// Set first image as preview
+	if (firstPhoto) {
+		if (const auto pMedia = firstPhoto->activeMediaView()) {
+			if (pMedia->loaded()) {
+				if (const auto imgPtr = pMedia->image(Data::PhotoSize::Large)) {
+					auto img = imgPtr->original();
+					if (!img.isNull()) {
+						mimeData->setImageData(std::move(img));
+					}
+				}
 			}
 		}
 	}
+
+	QGuiApplication::clipboard()->setMimeData(mimeData.release());
+}
+
+bool ListWidget::hasCopyRestrictionForSelected() const {
 	return false;
 }
 
@@ -2710,13 +2791,13 @@ void ListWidget::keyPressEvent(QKeyEvent *e) {
 		&& (hasSelectedText() || hasSelectedItems())
 		&& !showCopyRestriction()
 		&& !hasCopyRestrictionForSelected()) {
-		TextUtilities::SetClipboardText(getSelectedText());
+		copySelected();
 #ifdef Q_OS_MAC
 	} else if (key == Qt::Key_E
 		&& e->modifiers().testFlag(Qt::ControlModifier)
 		&& !showCopyRestriction()
 		&& !hasCopyRestrictionForSelected()) {
-		TextUtilities::SetClipboardText(getSelectedText(), QClipboard::FindBuffer);
+		copySelected();
 #endif // Q_OS_MAC
 	} else if (e == QKeySequence::Delete || key == Qt::Key_Backspace) {
 		_delegate->listDeleteRequest();
