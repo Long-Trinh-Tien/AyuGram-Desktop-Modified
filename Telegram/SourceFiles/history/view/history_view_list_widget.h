@@ -349,6 +349,7 @@ public:
 	[[nodiscard]] bool showCopyRestriction(HistoryItem *item = nullptr);
 	[[nodiscard]] bool showCopyMediaRestriction(not_null<HistoryItem*> item);
 	void copySelected();
+	void exportSelected(const QString &filepath);
 	[[nodiscard]] bool hasCopyRestrictionForSelected() const;
 	[[nodiscard]] bool showCopyRestrictionForSelected();
 	[[nodiscard]] bool hasSelectRestriction() const;

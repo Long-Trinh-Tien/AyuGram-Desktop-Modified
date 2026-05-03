@@ -1327,10 +1327,22 @@ base::unique_qptr<Ui::PopupMenu> FillContextMenu(
 			? tr::lng_context_copy_selected(tr::now)
 			: tr::lng_context_copy_selected_items(tr::now);
 		result->addAction(text, [=] {
-			if (!list->showCopyRestrictionForSelected()) {
-				list->copySelected();
-			}
+			list->copySelected();
 		}, &st::menuIconCopy);
+		
+		result->addAction(u"Export Selected as Markdown"_q, [=] {
+			auto filter = u"Markdown File (*.md);;"_q + FileDialog::AllFilesFilter();
+			FileDialog::GetWritePath(
+				list.get(),
+				tr::lng_save_file(tr::now),
+				filter,
+				filedialogDefaultName(u"export"_q, u".md"_q),
+				crl::guard(list.get(), [=](const QString &filepath) {
+					if (!filepath.isEmpty()) {
+						list->exportSelected(filepath);
+					}
+				}));
+		}, &st::menuIconDownload);
 	}
 	if (request.overSelection
 		&& !Ui::SkipTranslate(list->getSelectedText().rich)) {

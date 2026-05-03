@@ -109,6 +109,15 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <QtGui/QClipboard>
 #include <QtWidgets/QApplication>
 #include <QtCore/QMimeData>
+#include <QtCore/QTemporaryDir>
+#include <QtCore/QUuid>
+#include <QtCore/QFile>
+#include <QtCore/QFileInfo>
+#include <QtCore/QDir>
+#include <QtCore/QLocale>
+
+#include <QtCore/QEventLoop>
+#include <QtCore/QTimer>
 
 // AyuGram includes
 #include "ayu/ayu_settings.h"
@@ -2863,34 +2872,47 @@ void HistoryInner::showContextMenu(QContextMenuEvent *e, bool showFromTouch) {
 		? reinterpret_cast<DocumentData*>(
 			link->property(kDocumentLinkMediaProperty).toULongLong())
 		: nullptr;
+	if (isUponSelected > 0) {
+		const auto selectedText = getSelectedText();
+		if (!selectedText.empty()) {
+			_menu->addAction(
+				(isUponSelected > 1
+					? tr::lng_context_copy_selected_items(tr::now)
+					: tr::lng_context_copy_selected(tr::now)),
+				[=] { copySelectedText(); },
+				&st::menuIconCopy);
+			_menu->addAction(u"Export Selected as Markdown"_q, [=] {
+				auto filter = u"Markdown File (*.md);;"_q + FileDialog::AllFilesFilter();
+				FileDialog::GetWritePath(
+					this,
+					tr::lng_save_file(tr::now),
+					filter,
+					filedialogDefaultName(u"export"_q, u".md"_q),
+					crl::guard(this, [=](const QString &filepath) {
+						if (!filepath.isEmpty()) {
+							exportSelectedText(filepath);
+						}
+					}));
+			}, &st::menuIconDownload);
+		}
+		const auto item = _selected.empty() ? nullptr : _selected.begin()->first;
+		if (item && !Ui::SkipTranslate(selectedText.rich)) {
+			const auto peer = item->history()->peer;
+			_menu->addAction(tr::lng_context_translate_selected({}), [=] {
+				_controller->show(Box(
+					Ui::TranslateBox,
+					peer,
+					MsgId(),
+					getSelectedText().rich,
+					hasCopyRestrictionForSelected()));
+			}, &st::menuIconTranslate);
+		}
+	}
 	if (lnkPhoto || lnkDocument) {
 		const auto item = _dragStateItem;
 		const auto itemId = item ? item->fullId() : FullMsgId();
 		addReplyAction(item);
 
-		if (isUponSelected > 0) {
-			const auto selectedText = getSelectedText();
-			if (!hasCopyRestrictionForSelected()
-				&& !selectedText.empty()) {
-				_menu->addAction(
-					(isUponSelected > 1
-						? tr::lng_context_copy_selected_items(tr::now)
-						: tr::lng_context_copy_selected(tr::now)),
-					[=] { copySelectedText(); },
-					&st::menuIconCopy);
-			}
-			if (item && !Ui::SkipTranslate(selectedText.rich)) {
-				const auto peer = item->history()->peer;
-				_menu->addAction(tr::lng_context_translate_selected({}), [=] {
-					_controller->show(Box(
-						Ui::TranslateBox,
-						peer,
-						MsgId(),
-						getSelectedText().rich,
-						hasCopyRestrictionForSelected()));
-				}, &st::menuIconTranslate);
-			}
-		}
 		addItemActions(item, item);
 		if (!selectedState.count) {
 			if (lnkPhoto) {
@@ -3006,7 +3028,7 @@ void HistoryInner::showContextMenu(QContextMenuEvent *e, bool showFromTouch) {
 		if (isUponSelected > 0) {
 			addReplyAction(item);
 			const auto selectedText = getSelectedText();
-			if (!hasCopyRestrictionForSelected() && !selectedText.empty()) {
+			if (!selectedText.empty()) {
 				_menu->addAction(
 					((isUponSelected > 1)
 						? tr::lng_context_copy_selected_items(tr::now)
@@ -3350,45 +3372,128 @@ bool HistoryInner::showCopyRestrictionForSelected() {
 }
 
 void HistoryInner::copySelectedText() {
-	if (showCopyRestrictionForSelected()) {
-		return;
-	}
 	if (_selected.empty()) return;
 
 	auto urls = QList<QUrl>();
 	auto html = QString("<html><body>");
 	auto fullText = QString("");
 
-	// In HistoryInner, _selected is already a map of not_null<HistoryItem*>, which is sorted by position.
-	for (const auto &[item, selection] : _selected) {
-		const auto view = viewByItem(item);
-		if (!view) continue;
+	static QTemporaryDir *tempDir = nullptr;
+	if (!tempDir) {
+		tempDir = new QTemporaryDir();
+	}
 
-		// 1. Handle Text
+	auto firstPhoto = (PhotoData*)nullptr;
+
+	struct OrderedItem {
+		not_null<HistoryItem*> item;
+		TextSelection selection;
+	};
+	std::vector<OrderedItem> items;
+
+	// 1. Collect items and start ALL photo downloads first
+	static std::vector<std::shared_ptr<Data::PhotoMedia>> keepMediaAlive;
+	keepMediaAlive.clear();
+	for (const auto &[item, selection] : _selected) {
+		items.push_back({ item, selection });
+		if (const auto media = item->media()) {
+			if (const auto p = media->photo()) {
+				auto pMedia = p->activeMediaView();
+				if (!pMedia) {
+					pMedia = p->createMediaView();
+				}
+				keepMediaAlive.push_back(pMedia);
+				p->load(Data::PhotoSize::Large, item->fullId());
+			}
+		}
+	}
+
+	// Sort by position ascending (oldest first, newest at bottom)
+	std::sort(items.begin(), items.end(), [](const OrderedItem &a, const OrderedItem &b) {
+		return a.item->position() < b.item->position();
+	});
+
+	// 2. Pump events and wait for ALL photos to finish loading
+	for (int pump = 0; pump < 5; pump++) {
+		QCoreApplication::processEvents();
+		QThread::msleep(50);
+	}
+	for (const auto &it : items) {
+		if (const auto media = it.item->media()) {
+			if (const auto p = media->photo()) {
+				auto pMedia = p->activeMediaView();
+				if (!pMedia) {
+					pMedia = p->createMediaView();
+				}
+				int timeout = 200;
+				while (timeout > 0) {
+					if (pMedia && pMedia->loaded()) {
+						break;
+					}
+					if (!p->loading()) {
+						p->load(Data::PhotoSize::Large, it.item->fullId());
+					}
+					QCoreApplication::processEvents();
+					QThread::msleep(100);
+					timeout--;
+				}
+			}
+		}
+	}
+
+	// 3. Build output with loaded media
+	for (const auto &it : items) {
+		const auto item = it.item;
+
+		auto dateTime = ItemDateTime(item);
+		auto timeStr = QString(", [%1] ").arg(
+			QLocale().toString(dateTime, "dd.MM.yyyy HH:mm"));
+		auto headerStr = item->author()->name() + timeStr + "\n";
+
+		fullText += headerStr;
+		html += "<p><b>" + item->author()->name().toHtmlEscaped() + "</b>" + timeStr + "</p>";
+
+		// Handle Text
 		auto itemText = HistoryItemText(item).rich.text;
 		if (!itemText.isEmpty()) {
 			fullText += itemText + "\n";
 			html += "<p>" + itemText.toHtmlEscaped() + "</p>";
 		}
 
-		// 2. Handle Media and Markers
+		// Handle Media and Markers
 		if (const auto media = item->media()) {
 			QString marker;
 			if (const auto p = media->photo()) {
-				const auto pMedia = p->activeMediaView();
+				auto pMedia = p->activeMediaView();
 				if (pMedia && pMedia->loaded()) {
-					const auto bytes = pMedia->imageBytes(Data::PhotoSize::Large);
-					if (!bytes.isEmpty()) {
-						html += QString("<br><img src=\"data:image/jpeg;base64,%1\"><br>").arg(QString(bytes.toBase64()));
+					if (const auto imgPtr = pMedia->image(Data::PhotoSize::Large)) {
+						const auto bytes = pMedia->imageBytes(Data::PhotoSize::Large);
+						if (!bytes.isEmpty()) {
+							// Save to temp file for URL list
+							QString filepath = tempDir->path() + "/" + QUuid::createUuid().toString(QUuid::WithoutBraces) + ".jpg";
+							QFile f(filepath);
+							if (f.open(QIODevice::WriteOnly)) {
+								f.write(bytes);
+								f.close();
+								urls.push_back(QUrl::fromLocalFile(filepath));
+								html += QString("<br><img src=\"file:///%1\"><br>").arg(filepath);
+								marker = "[ Photo: " + filepath + " ]";
+							}
+						}
 					}
 				}
-				marker = "[ Photo ]";
+				if (marker.isEmpty()) {
+					marker = "[ Photo ]";
+				}
+				if (!firstPhoto) firstPhoto = p;
 			} else if (const auto d = media->document()) {
 				const auto filepath = d->filepath(true);
-				marker = "[ File: " + d->filename() + " ]";
 				if (!filepath.isEmpty()) {
 					urls.push_back(QUrl::fromLocalFile(filepath));
 					html += QString("<br><img src=\"file:///%1\"><br>").arg(filepath);
+					marker = "[ File: " + filepath + " ]";
+				} else {
+					marker = "[ File: " + d->filename() + " ]";
 				}
 			}
 
@@ -3405,19 +3510,16 @@ void HistoryInner::copySelectedText() {
 	mimeData->setHtml(html);
 	if (!urls.isEmpty()) {
 		mimeData->setUrls(urls);
-		// Set first image as preview
-		for (const auto &[item, selection] : _selected) {
-			if (const auto media = item->media()) {
-				if (const auto photo = media->photo()) {
-					const auto pMedia = photo->activeMediaView();
-					if (pMedia && pMedia->loaded()) {
-						if (const auto imgPtr = pMedia->image(Data::PhotoSize::Large)) {
-							auto img = imgPtr->original();
-							if (!img.isNull()) {
-								mimeData->setImageData(std::move(img));
-								break;
-							}
-						}
+	}
+
+	// Set first image as preview
+	if (firstPhoto) {
+		if (const auto pMedia = firstPhoto->activeMediaView()) {
+			if (pMedia->loaded()) {
+				if (const auto imgPtr = pMedia->image(Data::PhotoSize::Large)) {
+					auto img = imgPtr->original();
+					if (!img.isNull()) {
+						mimeData->setImageData(std::move(img));
 					}
 				}
 			}
@@ -3425,6 +3527,133 @@ void HistoryInner::copySelectedText() {
 	}
 
 	QGuiApplication::clipboard()->setMimeData(mimeData.release());
+}
+
+void HistoryInner::exportSelectedText(const QString &filepath) {
+	if (_selected.empty()) return;
+
+	auto fullText = QString("");
+	QString mdFolder = filepath;
+	if (mdFolder.endsWith(".md", Qt::CaseInsensitive)) {
+		mdFolder.chop(3);
+	}
+	mdFolder += "_files";
+
+	struct OrderedItem {
+		not_null<HistoryItem*> item;
+		TextSelection selection;
+	};
+	std::vector<OrderedItem> items;
+
+	// 1. Collect items and start ALL photo downloads first
+	static std::vector<std::shared_ptr<Data::PhotoMedia>> keepMediaAlive;
+	keepMediaAlive.clear();
+	for (const auto &[item, selection] : _selected) {
+		items.push_back({ item, selection });
+		if (const auto media = item->media()) {
+			if (const auto p = media->photo()) {
+				auto pMedia = p->activeMediaView();
+				if (!pMedia) {
+					pMedia = p->createMediaView();
+				}
+				keepMediaAlive.push_back(pMedia);
+				p->load(Data::PhotoSize::Large, item->fullId());
+			}
+		}
+	}
+	std::sort(items.begin(), items.end(), [](const OrderedItem &a, const OrderedItem &b) {
+		return a.item->position() < b.item->position();
+	});
+
+	// 2. Pump events and wait for ALL photos to finish loading
+	for (int pump = 0; pump < 5; pump++) {
+		QCoreApplication::processEvents();
+		QThread::msleep(50);
+	}
+	for (const auto &it : items) {
+		if (const auto media = it.item->media()) {
+			if (const auto p = media->photo()) {
+				auto pMedia = p->activeMediaView();
+				if (!pMedia) {
+					pMedia = p->createMediaView();
+				}
+				int timeout = 200;
+				while (timeout > 0) {
+					if (pMedia && pMedia->loaded()) {
+						break;
+					}
+					if (!p->loading()) {
+						p->load(Data::PhotoSize::Large, it.item->fullId());
+					}
+					QCoreApplication::processEvents();
+					QThread::msleep(100);
+					timeout--;
+				}
+			}
+		}
+	}
+
+	for (const auto &it : items) {
+		const auto item = it.item;
+
+		auto dateTime = ItemDateTime(item);
+		auto timeStr = QString(", [%1]\n").arg(
+			QLocale().toString(dateTime, "dd.MM.yyyy HH:mm"));
+		auto headerStr = "**" + item->author()->name() + "**" + timeStr;
+
+		fullText += headerStr;
+
+		// 1. Handle Text
+		auto itemText = HistoryItemText(item).rich.text;
+		if (!itemText.isEmpty()) {
+			fullText += itemText + "\n\n";
+		}
+
+		// 2. Handle Media and Markers
+		if (const auto media = item->media()) {
+			QString marker;
+			if (const auto p = media->photo()) {
+				auto pMedia = p->activeMediaView();
+				if (pMedia && pMedia->loaded()) {
+					if (const auto imgPtr = pMedia->image(Data::PhotoSize::Large)) {
+						const auto bytes = pMedia->imageBytes(Data::PhotoSize::Large);
+						if (!bytes.isEmpty()) {
+							QDir().mkpath(mdFolder);
+							QString localName = QUuid::createUuid().toString(QUuid::WithoutBraces) + ".jpg";
+							QString imgPath = mdFolder + "/" + localName;
+							QFile f(imgPath);
+							if (f.open(QIODevice::WriteOnly)) {
+								f.write(bytes);
+								f.close();
+								QFileInfo fi(filepath);
+								marker = "![Photo](" + fi.completeBaseName() + "_files/" + localName + ")";
+							}
+						}
+					}
+				}
+				if (marker.isEmpty()) {
+					marker = "[ Photo ]";
+				}
+			} else if (const auto d = media->document()) {
+				const auto docpath = d->filepath(true);
+				if (!docpath.isEmpty()) {
+					marker = "[ File: " + docpath + " ]";
+				} else {
+					marker = "[ File: " + d->filename() + " ]";
+				}
+			}
+
+			if (!marker.isEmpty()) {
+				fullText += marker + "\n\n";
+			}
+		}
+	}
+
+	QFile f(filepath);
+	if (f.open(QIODevice::WriteOnly)) {
+		f.write(fullText.toUtf8());
+		f.close();
+	}
 }
 
 void HistoryInner::editCaptionUploadLayer(not_null<HistoryItem*> item) {
@@ -3623,8 +3852,7 @@ void HistoryInner::keyPressEvent(QKeyEvent *e) {
 		copySelectedText();
 #ifdef Q_OS_MAC
 	} else if (e->key() == Qt::Key_E
-		&& e->modifiers().testFlag(Qt::ControlModifier)
-		&& !showCopyRestrictionForSelected()) {
+		&& e->modifiers().testFlag(Qt::ControlModifier)) {
 		TextUtilities::SetClipboardText(getSelectedText(), QClipboard::FindBuffer);
 #endif // Q_OS_MAC
 	} else if (e == QKeySequence::Delete || e->key() == Qt::Key_Backspace) {
