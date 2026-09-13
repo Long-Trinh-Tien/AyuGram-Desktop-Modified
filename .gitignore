@@ -67,3 +67,14 @@ settings.local.json
 
 # Project specific
 Telegram/SourceFiles/_other/packer_private.h
+
+# Local AI-agent scaffolding (machine-specific, never commit)
+/.opencode/
+/opencode.json
+/package.json
+/package-lock.json
+/hello.cpp
+/internet-archive*
+/Telegram/build_output.log
+/~/
+
